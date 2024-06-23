@@ -1,0 +1,68 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from transformers import BartTokenizer, BartForConditionalGeneration
+import whisper
+import torch
+import os
+import uvicorn
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Load whisper model and Bart model
+whisper_model = whisper.load_model("large-v3")
+bart_tokenizer = BartTokenizer.from_pretrained('facebook/bart-large-cnn')
+bart_model = BartForConditionalGeneration.from_pretrained('facebook/bart-large-cnn')
+
+app = FastAPI()
+
+def transcribe_and_summarize(file_path: str) -> dict:
+    try:
+        # Transcribe audio
+        audio = whisper.load_audio(file_path)
+        audio = whisper.pad_or_trim(audio)
+        mel = whisper.log_mel_spectrogram(audio).to(whisper_model.device)
+        options = whisper.DecodingOptions(fp16=False)
+        transcript_result = whisper.decode(whisper_model, mel, options)
+        transcript = transcript_result.text
+
+        # Summarize transcript
+        inputs = bart_tokenizer([transcript], max_length=1024, return_tensors='pt', truncation=True)
+        summary_ids = bart_model.generate(inputs['input_ids'], max_length=150, min_length=40, length_penalty=2.0, num_beams=4, early_stopping=True)
+        summary = bart_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+
+        # Extract timestamps
+        words = transcript.split()
+        timestamps = [(i*5, (i+1)*5, ' '.join(words[i*50:(i+1)*50])) for i in range(len(words) // 50)]
+
+        return {
+            "transcript": transcript,
+            "summary": summary,
+            "timestamps": timestamps
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/process-audio/")
+async def process_audio(file: UploadFile = File(...)):
+    try:
+        # Save uploaded file temporarily
+        file_location = f"temp_{file.filename}"
+        with open(file_location, "wb") as file_object:
+            file_object.write(file.file.read())
+        
+        # Process audio file
+        result = transcribe_and_summarize(file_location)
+        
+        # Remove temporary file
+        os.remove(file_location)
+
+        return JSONResponse(content=result)
+    
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
